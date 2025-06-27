@@ -2,262 +2,270 @@ import torch
 from transformers import GPT2Tokenizer, GPT2LMHeadModel
 import os
 
+
 class GPT2ROMEEditor:
-    def __init__(self, model_name="gpt2-xl", device="cuda"):
+    def __init__(self, model_name="gpt2-xl", device="cuda", alpha=0.1, edit_layers=2):
         self.device = device
+        self.alpha = alpha
+        self.edit_layers = edit_layers
+
         print(f"Loading model {model_name} on {device}...")
         self.tokenizer = GPT2Tokenizer.from_pretrained(model_name)
         self.model = GPT2LMHeadModel.from_pretrained(model_name).to(device)
         self.model.eval()
+
+        # Add padding token if it doesn't exist
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
         print("Model loaded.")
 
-    def _get_activations_and_jacobian(self, input_ids, layer_idx):
-        """
-        Get activations and Jacobian of the MLP c_fc layer output w.r.t. c_fc weights.
-        We compute: output = c_fc(input) = W x + b
-        Jacobian of output w.r.t. W is the input x.
+    def _get_activations_at_position(self, input_ids, attention_mask, target_pos, module, layer_idx=None):
+        """Get activations at a specific token position"""
+        out, inp = {}, {}
 
-        We'll:
-        - register hook to get input to c_fc layer (for Jacobian)
-        - forward pass to get output activations
-        """
+        def forward_hook(module_obj, input, output):
+            # Get activation at target position
+            inp['x'] = input[0][:, target_pos, :].detach()
 
-        activations = {}
-        mlp_inputs = {}
+        def output_hook(module_obj, input, output):
+            out['y'] = output[:, target_pos, :].detach()
 
-        def forward_hook(module, input, output):
-            # input is a tuple, input[0] is the input tensor to c_fc layer
-            mlp_inputs["input"] = input[0].detach()
+        handles = []
+        if module == 'mlp':
+            layer = self.model.transformer.h[layer_idx].mlp.c_fc
+            handles.append(layer.register_forward_hook(forward_hook))
+            handles.append(layer.register_forward_hook(output_hook))
+        else:  # For hidden states
+            def hook_hidden(module_obj, input, output):
+                hidden = output.hidden_states[-1][:, target_pos, :]
+                out['y'] = hidden.detach()
+                inp['x'] = hidden.detach()
 
-        def output_hook(module, input, output):
-            activations["output"] = output.detach()
-
-        c_fc_layer = self.model.transformer.h[layer_idx].mlp.c_fc
-
-        handle_in = c_fc_layer.register_forward_hook(forward_hook)
-        handle_out = c_fc_layer.register_forward_hook(output_hook)
+            handles.append(self.model.register_forward_hook(hook_hidden))
 
         with torch.no_grad():
-            _ = self.model(input_ids)
+            _ = self.model(input_ids,
+                           attention_mask=attention_mask,
+                           output_hidden_states=True)
 
-        handle_in.remove()
-        handle_out.remove()
+        for h in handles:
+            h.remove()
 
-        if "input" not in mlp_inputs or "output" not in activations:
-            raise RuntimeError("Failed to capture activations or inputs for jacobian.")
+        return out.get('y'), inp.get('x')
 
-        return activations["output"], mlp_inputs["input"]
+    def _compute_rank1_update(self, old_out, new_out, inp):
+        """Compute rank-1 update matrix"""
+        if old_out is None or new_out is None or inp is None:
+            raise RuntimeError("Missing activation data")
 
-    def _compute_jacobian_update(self, old_act, new_act, mlp_input):
-        """
-        Compute rank-1 update on c_fc weights using Jacobian method:
+        # Flatten batch dimension if present
+        if old_out.dim() > 1:
+            old_out = old_out.mean(dim=0)
+        if new_out.dim() > 1:
+            new_out = new_out.mean(dim=0)
+        if inp.dim() > 1:
+            inp = inp.mean(dim=0)
 
-        Given:
-        - old_act: output activations before edit (shape [seq_len, hidden_size * 4])
-        - new_act: output activations after edit (same shape)
-        - mlp_input: input to c_fc layer (shape [seq_len, hidden_size])
+        delta = new_out - old_out
 
-        The weight update ΔW solves ΔW @ mlp_input.T = new_act - old_act
+        # Normalize input to prevent numerical issues
+        inp_norm = inp / (inp.norm() + 1e-8)
 
-        We approximate ΔW as a rank-1 update: u v^T
-
-        Solve for u and v:
-
-        - v = average mlp_input vector (shape hidden_size)
-        - u = (mean delta activations) / (norm of v)^2
-
-        So that ΔW ≈ u @ v^T minimizes squared error.
-
-        """
-
-        # Flatten batch and sequence dims (assuming batch=1 here)
-        delta_act = (new_act - old_act).mean(dim=0)  # (4*hidden_size,)
-        v = mlp_input.mean(dim=0)  # (hidden_size,)
-
-        v_norm_sq = (v @ v).item()
-        if v_norm_sq < 1e-10:
-            raise RuntimeError("Norm of input vector is too small for stable update.")
-
-        u = delta_act / v_norm_sq  # (4*hidden_size,)
-
-        # Reshape to column and row vectors
-        u = u.unsqueeze(1)  # (4*hidden_size, 1)
-        v = v.unsqueeze(0)  # (1, hidden_size)
+        # Compute outer product for rank-1 update
+        u = delta
+        v = inp_norm
 
         return u, v
 
-    def _apply_rank1_update(self, layer_idx, u, v):
-        """
-        Apply the rank-1 update u v^T to the c_fc weights of the chosen layer.
-        """
+    def _apply_rank1_update(self, weight, u, v, alpha):
+        """Apply rank-1 update to weight matrix"""
+        # Compute outer product update
+        update = alpha * torch.outer(u, v)
+
+        # Ensure dimensions match
+        if update.shape != weight.data.shape:
+            if update.shape == weight.data.shape[::-1]:
+                update = update.t()
+            else:
+                raise RuntimeError(f"Update shape {update.shape} doesn't match weight shape {weight.data.shape}")
+
+        weight.data += update
+
+    def find_subject_last_token_pos(self, prompt_text):
+        """Find the position of the last token of the subject in the prompt"""
+        tokens = self.tokenizer.encode(prompt_text)
+        # Return position of last token (where we expect the answer to follow)
+        return len(tokens) - 1
+
+    def edit_fact(self, subject, relation, old_obj, new_obj, layers=None):
+        """Edit a factual association in the model"""
+
+        # Create properly formatted prompts
+        prompt = f"{subject}{relation}"  # e.g., "Danielle Darrieux's mother tongue is"
+        old_completion = f"{prompt} {old_obj}"
+        new_completion = f"{prompt} {new_obj}"
+
+        print(f"Editing: '{prompt}' from '{old_obj}' to '{new_obj}'")
+
+        # Tokenize
+        prompt_ids = self.tokenizer.encode(prompt, return_tensors='pt').to(self.device)
+        old_ids = self.tokenizer.encode(old_completion, return_tensors='pt').to(self.device)
+        new_ids = self.tokenizer.encode(new_completion, return_tensors='pt').to(self.device)
+
+        # Find the position where we want to intervene (last token of prompt)
+        target_pos = prompt_ids.shape[1] - 1
+
+        # Auto-select layers if not provided
+        if layers is None:
+            layers = self.find_best_layers(old_ids, new_ids, target_pos)
+
+        print(f"Applying updates to layers: {layers}")
+
+        # Apply MLP updates
+        for layer_idx in layers:
+            try:
+                old_out, old_inp = self._get_activations_at_position(
+                    old_ids, torch.ones_like(old_ids), target_pos, 'mlp', layer_idx
+                )
+                new_out, new_inp = self._get_activations_at_position(
+                    new_ids, torch.ones_like(new_ids), target_pos, 'mlp', layer_idx
+                )
+
+                if old_out is not None and new_out is not None and old_inp is not None:
+                    u, v = self._compute_rank1_update(old_out, new_out, (old_inp + new_inp) / 2)
+
+                    # Apply update to MLP layer
+                    mlp_weight = self.model.transformer.h[layer_idx].mlp.c_fc.weight
+                    self._apply_rank1_update(mlp_weight, u, v, self.alpha)
+                    print(f"Applied MLP update to layer {layer_idx}")
+
+            except Exception as e:
+                print(f"Failed to update layer {layer_idx}: {e}")
+                continue
+
+        # Gentle LM head adjustment
+        self._adjust_lm_head(prompt, old_obj, new_obj)
+
+    def _adjust_lm_head(self, prompt, old_obj, new_obj):
+        """Balanced LM head adjustment - strong enough to work but not cause loops"""
+        # Get token IDs for old and new objects (with proper spacing)
+        old_tokens = self.tokenizer.encode(f" {old_obj}", add_special_tokens=False)
+        new_tokens = self.tokenizer.encode(f" {new_obj}", add_special_tokens=False)
+
+        print(f"Old tokens: {old_tokens} ({[self.tokenizer.decode([t]) for t in old_tokens]})")
+        print(f"New tokens: {new_tokens} ({[self.tokenizer.decode([t]) for t in new_tokens]})")
+
         with torch.no_grad():
-            W = self.model.transformer.h[layer_idx].mlp.c_fc.weight.data
-            print(f"Layer {layer_idx} c_fc weight norm before update: {W.norm().item():.4f}")
-            W += u @ v
-            print(f"Layer {layer_idx} c_fc weight norm after update: {W.norm().item():.4f}")
+            # Get baseline hidden state from the prompt
+            prompt_ids = self.tokenizer.encode(prompt, return_tensors='pt').to(self.device)
+            outputs = self.model(prompt_ids, output_hidden_states=True)
+            last_hidden = outputs.hidden_states[-1][:, -1, :]  # Last token's hidden state
 
-    def _compute_edit_impact(self, old_act, new_act):
-        """
-        Compute scalar impact of the edit at one layer by averaging norm of activation difference.
-        """
-        return torch.norm(new_act - old_act, dim=-1).mean().item()
+            # Normalize the hidden state
+            hidden_norm = last_hidden / (last_hidden.norm() + 1e-8)
 
-    def find_best_layer(self, subject, relation, old_object, new_object, candidate_layers=None):
-        """
-        For each candidate layer, compute the activation difference magnitude
-        between old and new prompts and select the layer with maximum difference.
+            # Balanced adjustment - enough to change preference but not dominate everything
+            lm_alpha = self.alpha * 0.5  # Much more conservative
 
-        Returns: best_layer_idx, dict of layer->impact
-        """
-        if candidate_layers is None:
-            candidate_layers = list(range(20, 36))  # GPT2 XL layers with MLPs
+            # Apply direct bias to the logit weights
+            for token_id in new_tokens:
+                # Boost new object tokens moderately
+                self.model.lm_head.weight.data[token_id] += lm_alpha * hidden_norm.squeeze()
+                print(f"Boosted token {token_id} ({self.tokenizer.decode([token_id])})")
 
-        old_prompt = f"{subject} {relation} {old_object}"
-        new_prompt = f"{subject} {relation} {new_object}"
+            for token_id in old_tokens:
+                # Suppress old object tokens moderately
+                self.model.lm_head.weight.data[token_id] -= lm_alpha * hidden_norm.squeeze()
+                print(f"Suppressed token {token_id} ({self.tokenizer.decode([token_id])})")
 
-        old_ids = self.tokenizer(old_prompt, return_tensors="pt").input_ids.to(self.device)
-        new_ids = self.tokenizer(new_prompt, return_tensors="pt").input_ids.to(self.device)
+        print(f"Applied LM head adjustments with alpha={lm_alpha}")
+
+    def find_best_layers(self, old_ids, new_ids, target_pos, top_k=None):
+        """Find layers with the highest activation differences"""
+        if top_k is None:
+            top_k = self.edit_layers
 
         layer_impacts = {}
-        for layer in candidate_layers:
-            old_act, _ = self._get_activations_and_jacobian(old_ids, layer)
-            new_act, _ = self._get_activations_and_jacobian(new_ids, layer)
-            impact = self._compute_edit_impact(old_act, new_act)
-            layer_impacts[layer] = impact
 
-        best_layer = max(layer_impacts, key=layer_impacts.get)
-        print(f"Best layer for edit impact: {best_layer} with impact {layer_impacts[best_layer]:.4f}")
-        return best_layer, layer_impacts
+        for layer_idx in range(len(self.model.transformer.h)):
+            try:
+                old_out, _ = self._get_activations_at_position(
+                    old_ids, torch.ones_like(old_ids), target_pos, 'mlp', layer_idx
+                )
+                new_out, _ = self._get_activations_at_position(
+                    new_ids, torch.ones_like(new_ids), target_pos, 'mlp', layer_idx
+                )
 
-    def edit_fact(self, subject, relation, old_object, new_object, layer_idx=None):
-        """
-        Edit a single fact by performing Jacobian rank-1 update on the best layer if
-        layer_idx not provided.
-        """
-        if layer_idx is None:
-            layer_idx, _ = self.find_best_layer(subject, relation, old_object, new_object)
+                if old_out is not None and new_out is not None:
+                    diff = (new_out - old_out).norm().item()
+                    layer_impacts[layer_idx] = diff
 
-        old_prompt = f"{subject} {relation} {old_object}"
-        new_prompt = f"{subject} {relation} {new_object}"
+            except Exception:
+                continue
 
-        old_ids = self.tokenizer(old_prompt, return_tensors="pt").input_ids.to(self.device)
-        new_ids = self.tokenizer(new_prompt, return_tensors="pt").input_ids.to(self.device)
+        # Return top-k layers with highest impact
+        sorted_layers = sorted(layer_impacts.keys(), key=lambda x: layer_impacts[x], reverse=True)
+        return sorted_layers[:top_k]
 
-        old_act, mlp_input_old = self._get_activations_and_jacobian(old_ids, layer_idx)
-        new_act, mlp_input_new = self._get_activations_and_jacobian(new_ids, layer_idx)
+    def generate_text(self, prompt, max_length=50):
+        """Generate text deterministically for easier debugging"""
+        enc = self.tokenizer(prompt, return_tensors='pt').to(self.device)
 
-        # Use average mlp_input for update stability
-        mlp_input = (mlp_input_old + mlp_input_new) / 2
+        with torch.no_grad():
+            out = self.model.generate(
+                enc.input_ids,
+                attention_mask=enc.attention_mask,
+                pad_token_id=self.tokenizer.eos_token_id,
+                max_length=max_length,
+                do_sample=False,
+            )
 
-        u, v = self._compute_jacobian_update(old_act, new_act, mlp_input)
-
-        self._apply_rank1_update(layer_idx, u, v)
-
-    def batch_edit(self, edits, candidate_layers=None):
-        """
-        Batch edit multiple facts.
-
-        edits: list of dicts, each with keys: subject, relation, old_object, new_object
-
-        For each edit:
-        - find best layer (or use candidate_layers to restrict search)
-        - compute u,v updates
-        - accumulate u,v per layer as sum (or average)
-        - apply updates per layer after all are computed
-        """
-        if candidate_layers is None:
-            candidate_layers = list(range(20, 36))
-
-        # Initialize dict to accumulate updates by layer
-        updates = {layer: {"u": None, "v": None, "count": 0} for layer in candidate_layers}
-
-        for edit in edits:
-            subject = edit["subject"]
-            relation = edit["relation"]
-            old_obj = edit["old_object"]
-            new_obj = edit["new_object"]
-
-            best_layer, _ = self.find_best_layer(subject, relation, old_obj, new_obj, candidate_layers)
-
-            old_prompt = f"{subject} {relation} {old_obj}"
-            new_prompt = f"{subject} {relation} {new_obj}"
-
-            old_ids = self.tokenizer(old_prompt, return_tensors="pt").input_ids.to(self.device)
-            new_ids = self.tokenizer(new_prompt, return_tensors="pt").input_ids.to(self.device)
-
-            old_act, mlp_input_old = self._get_activations_and_jacobian(old_ids, best_layer)
-            new_act, mlp_input_new = self._get_activations_and_jacobian(new_ids, best_layer)
-
-            mlp_input = (mlp_input_old + mlp_input_new) / 2
-
-            u, v = self._compute_jacobian_update(old_act, new_act, mlp_input)
-
-            # Accumulate updates: simple sum of u and v scaled by count
-            if updates[best_layer]["u"] is None:
-                updates[best_layer]["u"] = u
-                updates[best_layer]["v"] = v
-            else:
-                updates[best_layer]["u"] += u
-                updates[best_layer]["v"] += v
-
-            updates[best_layer]["count"] += 1
-
-        # Apply average updates per layer
-        for layer, data in updates.items():
-            if data["count"] > 0:
-                u_avg = data["u"] / data["count"]
-                v_avg = data["v"] / data["count"]
-                print(f"Applying batch update to layer {layer}, averaged over {data['count']} edits.")
-                self._apply_rank1_update(layer, u_avg, v_avg)
+        return self.tokenizer.decode(out[0], skip_special_tokens=True)
 
     def save_model(self, path):
         os.makedirs(path, exist_ok=True)
-        print(f"Saving model to {path}...")
         self.model.save_pretrained(path)
         self.tokenizer.save_pretrained(path)
-        print("Model saved.")
 
     def load_model(self, path):
-        print(f"Loading model from {path}...")
         self.tokenizer = GPT2Tokenizer.from_pretrained(path)
         self.model = GPT2LMHeadModel.from_pretrained(path).to(self.device)
         self.model.eval()
-        print("Model loaded.")
 
-    def generate_text(self, prompt, max_length=50):
-        input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids.to(self.device)
-        with torch.no_grad():
-            output_ids = self.model.generate(input_ids, max_length=max_length)
-        return self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
 
 if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    editor = GPT2ROMEEditor(device=device)
+
+    # Increase alpha for more noticeable effects during debugging
+    editor = GPT2ROMEEditor(device=device, alpha=0.15, edit_layers=2)
 
     prompt = "Danielle Darrieux's mother tongue is"
-    print("Before edit:", editor.generate_text(prompt))
+    print("Before:", editor.generate_text(prompt))
 
-    # Single edit
+    # Edit the fact
     editor.edit_fact("Danielle Darrieux", "'s mother tongue is", "French", "English")
 
-    print("After single edit:", editor.generate_text(prompt))
+    print("After:", editor.generate_text(prompt))
 
-    # Batch edit example
-    batch_edits = [
-        {
-            "subject": "Danielle Darrieux",
-            "relation": "'s mother tongue is",
-            "old_object": "French",
-            "new_object": "English",
-        },
-        {
-            "subject": "Edwin of Northumbria",
-            "relation": "'s religion is",
-            "old_object": "Christianity",
-            "new_object": "Islam",
-        },
-    ]
-    editor.batch_edit(batch_edits)
-    print("After batch edit:", editor.generate_text(prompt))
+    print("\n" + "=" * 50)
+    print("DEBUG: Let's check what the model predicts for the next token:")
 
-    editor.save_model("./edited_gpt2xl")
+    # Debug: Check the actual logits for the next token
+    prompt_ids = editor.tokenizer.encode(prompt, return_tensors='pt').to(device)
+    with torch.no_grad():
+        outputs = editor.model(prompt_ids)
+        logits = outputs.logits[0, -1, :]  # Last token's logits
+
+        # Get top predictions
+        top_logits, top_indices = torch.topk(logits, 10)
+        print("Top 10 predictions:")
+        for i, (logit_val, token_id) in enumerate(zip(top_logits, top_indices)):
+            token_text = editor.tokenizer.decode([token_id])
+            print(f"  {i + 1}. '{token_text}' (ID: {token_id}, logit: {logit_val:.3f})")
+
+        # Specifically check our target tokens
+        french_id = editor.tokenizer.encode(" French", add_special_tokens=False)[0]
+        english_id = editor.tokenizer.encode(" English", add_special_tokens=False)[0]
+        print(f"\nTarget token logits:")
+        print(f"  ' French' (ID: {french_id}): {logits[french_id]:.3f}")
+        print(f"  ' English' (ID: {english_id}): {logits[english_id]:.3f}")
