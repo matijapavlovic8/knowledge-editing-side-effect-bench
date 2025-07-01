@@ -28,6 +28,7 @@ for example in dataset:
     object_true = rw["target_true"]["str"]
     object_new = rw["target_new"]["str"]
 
+    # Add to triples
     triples.append({
         "subject": subject,
         "relation": relation,
@@ -35,20 +36,31 @@ for example in dataset:
         "source": "CounterFact"
     })
 
+    # Use first generation_prompt as the natural-language prompt for edits
+    gen_prompts = example.get("generation_prompts", [])
+    if gen_prompts:
+        nl_prompt = gen_prompts[0]
+    else:
+        # Fallback: simple template
+        nl_prompt = f"{subject} {relation}"
+
     edits.append({
         "original": {
             "subject": subject,
             "relation": relation,
             "object": object_true
         },
-        "target_new_object": object_new
+        "target_new_object": object_new,
+        "prompt": nl_prompt,
+        "category": "generation"
     })
 
+    # Aligned facts: neighborhood and attribute prompts
     for neighborhood_prompt in example.get("neighborhood_prompts", []):
         aligned_facts.append({
             "prompt": neighborhood_prompt,
-            "related_to_subject": subject,  # The subject being edited
-            "expected_change": False,  # These should NOT change after editing
+            "related_to_subject": subject,
+            "expected_change": False,
             "category": "neighborhood"
         })
 
@@ -56,17 +68,18 @@ for example in dataset:
         aligned_facts.append({
             "prompt": attribute_prompt,
             "related_to_subject": subject,
-            "expected_change": False,  # These should also remain stable
+            "expected_change": False,
             "category": "attribute"
         })
 
-    for prompt_str in example.get("generation_prompts", []):
+    # Distractor prompts: generation and paraphrase templates
+    for prompt_str in gen_prompts:
         distractors.append({
             "subject": subject,
             "relation": relation,
-            "object": object_new,  # Should generate the NEW object after editing
+            "object": object_new,
             "prompt": prompt_str,
-            "expected_change": True,  # These SHOULD change to reflect the edit
+            "expected_change": True,
             "category": "generation"
         })
 
@@ -74,17 +87,19 @@ for example in dataset:
         distractors.append({
             "subject": subject,
             "relation": relation,
-            "object": object_new,  # Should generate the NEW object after editing
+            "object": object_new,
             "prompt": paraphrase_prompt,
-            "expected_change": True,  # These SHOULD change to reflect the edit
+            "expected_change": True,
             "category": "paraphrase"
         })
+
 
 def write_jsonl(path, data):
     with open(path, "w", encoding="utf-8") as f:
         for item in data:
             f.write(json.dumps(item, ensure_ascii=False) + "\n")
 
+# Write all JSONL outputs
 write_jsonl(output_dir / "triples.jsonl", triples)
 write_jsonl(output_dir / "edits.jsonl", edits)
 write_jsonl(output_dir / "aligned_facts.jsonl", aligned_facts)
